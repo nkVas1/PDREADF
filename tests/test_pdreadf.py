@@ -16,6 +16,9 @@ import tempfile
 from pathlib import Path
 from typing import List
 
+# Use the offscreen Qt platform when no real display is available (headless CI).
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 import fitz
 import pytest
 
