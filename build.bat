@@ -18,7 +18,7 @@ if exist "icon.ico" (
 )
 
 echo Building PDREADF...
-python -m pyinstaller --clean --onefile --windowed --name PDREADF %ICON_ARG% --collect-all fitz pdreadf.py
+python -m PyInstaller --clean --onefile --windowed --name PDREADF %ICON_ARG% --collect-all fitz --collect-all pikepdf --collect-all PyQt6 pdreadf.py
 if errorlevel 1 goto :error
 
 if not exist "dist\PDREADF.exe" (
