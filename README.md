@@ -132,7 +132,8 @@ build.bat
 
 This runs:
 ```bat
-pyinstaller --onefile --windowed --name PDREADF --icon=icon.ico pdreadf.py
+pip install -r requirements.txt
+pyinstaller --clean --onefile --windowed --name PDREADF --icon=icon.ico --collect-all fitz pdreadf.py
 ```
 
 The standalone `PDREADF.exe` is placed in `dist\`.
