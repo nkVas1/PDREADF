@@ -13,13 +13,15 @@ A full-featured, cross-platform PDF Reader & Editor built with **PyQt6** and **P
 |---|---|
 | **Viewing** | Single page, dual-page, and continuous-scroll modes |
 | **Zoom** | Ctrl+/Ctrl−/scroll-wheel zoom, fit-page, preset percentages |
-| **Navigation** | Thumbnail sidebar, page-number spin box, keyboard arrows |
+| **Navigation** | Thumbnail sidebar (toggle with Ctrl+B), page-number spin box, keyboard arrows |
 | **Search** | Full-text search across all pages with yellow highlight overlays and prev/next navigation |
 | **Bookmarks** | Add, list, navigate to, and delete page bookmarks |
 | **Annotations** | Highlight · Underline · Strikeout · Freehand ink · Text notes (all via PyMuPDF) |
 | **Page editing** | Add blank page · Delete page · Rotate 90/180/270° · Drag-drop reorder in sidebar |
 | **File operations** | Open · Save · Save As · Merge PDFs · Split PDF · Extract text · Extract images |
 | **Export** | Export current page as PNG/JPEG · Export all pages as images |
+| **Productivity** | Copy current/all document text to clipboard · Clear recent files |
+| **Document utilities** | Document info dialog (metadata + file size/pages) · Optimize PDF (compressed output) |
 | **Print** | System print dialog with full page scaling |
 | **UI** | Dark / light theme toggle · Drag-and-drop file open · Multiple tabs · Status bar |
 | **Persistence** | Settings (theme, zoom, recent files, window geometry) saved as JSON |
@@ -84,6 +86,16 @@ python pdreadf.py /path/to/document.pdf
 - Type your query and press Enter or click **Find**
 - Use **◀ ▶** buttons to step through matches
 
+### Productivity actions
+- **Ctrl+Shift+C** – copy current page text to clipboard
+- **Edit → Copy All Document Text** – copy all extracted text to clipboard
+- **View → Toggle Sidebar** (Ctrl+B) – hide/show Pages/Search/Bookmarks sidebar
+- **File → Recent Files → Clear Recent Files** – quickly reset recent history
+
+### Document utilities
+- **Tools → Document Info** – view path, page count, file size, and PDF metadata
+- **Tools → Optimize PDF** – save a cleaned/deflated optimized copy
+
 ### Annotating
 1. Select an annotation tool from the **Annotation** toolbar at the top of each tab
 2. Draw a rectangle over the desired region (or draw freehand for the Ink tool)
@@ -111,6 +123,8 @@ python pdreadf.py /path/to/document.pdf
 | Ctrl+W | Close current tab |
 | Ctrl+F | Find / Search |
 | Ctrl+G | Go to page |
+| Ctrl+B | Toggle sidebar |
+| Ctrl+Shift+C | Copy current page text |
 | Ctrl+= | Zoom in |
 | Ctrl+− | Zoom out |
 | Ctrl+0 | Fit page |

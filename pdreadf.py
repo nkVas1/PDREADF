@@ -1493,7 +1493,7 @@ class Manager:
 
     @staticmethod
     def optimize_pdf(path: str, output_path: Optional[str] = None) -> str:
-        """Optimise a PDF by rewriting it with garbage collection and deflate.
+        """Optimize a PDF by rewriting it with garbage collection and deflate.
 
         Returns the path to the written optimised file.
         """
@@ -2354,7 +2354,9 @@ class MainWindow(QMainWindow):
             return
         try:
             Manager.optimize_pdf(tab.path, out)
-            QMessageBox.information(self, "Done", f"Optimized PDF saved to:\n{out}")
+            QMessageBox.information(
+                self, "PDF Optimized", f"Optimized PDF saved to:\n{out}"
+            )
             if (
                 QMessageBox.question(
                     self,
