@@ -17,6 +17,7 @@ import os
 import shutil
 import sys
 import tempfile
+import copy
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -54,6 +55,7 @@ from PyQt6.QtGui import (
     QMouseEvent,
     QPaintEvent,
     QPainter,
+    QPalette,
     QPen,
     QPixmap,
     QResizeEvent,
@@ -125,7 +127,7 @@ class Settings:
     }
 
     def __init__(self) -> None:
-        self._data: Dict[str, Any] = dict(self._DEFAULTS)
+        self._data: Dict[str, Any] = copy.deepcopy(self._DEFAULTS)
         self.load()
 
     # ── persistence ───────────────────────────────────────────
@@ -168,6 +170,11 @@ class Settings:
             recent.remove(path)
         recent.insert(0, path)
         self._data["recent_files"] = recent[: self._data.get("max_recent", 10)]
+        self.save()
+
+    def clear_recent(self) -> None:
+        """Clear the recent-files list."""
+        self._data["recent_files"] = []
         self.save()
 
     # ── typed properties ──────────────────────────────────────
@@ -1484,6 +1491,37 @@ class Manager:
             Manager.export_page_as_image(doc, i, path, zoom)
         return doc.page_count()
 
+    @staticmethod
+    def optimize_pdf(path: str, output_path: Optional[str] = None) -> str:
+        """Optimise a PDF by rewriting it with garbage collection and deflate.
+
+        Returns the path to the written optimised file.
+        """
+        out = output_path or path
+        with fitz.open(path) as doc:
+            doc.save(out, garbage=4, deflate=True, clean=True)
+        return out
+
+    @staticmethod
+    def get_document_info(path: str) -> Dict[str, Any]:
+        """Return document summary info useful for a quick diagnostics dialog."""
+        with fitz.open(path) as doc:
+            metadata = doc.metadata or {}
+            pages = len(doc)
+        size_bytes = os.path.getsize(path)
+        return {
+            "path": path,
+            "pages": pages,
+            "size_bytes": size_bytes,
+            "size_human": Utils.human_size(size_bytes),
+            "title": metadata.get("title", ""),
+            "author": metadata.get("author", ""),
+            "subject": metadata.get("subject", ""),
+            "keywords": metadata.get("keywords", ""),
+            "creator": metadata.get("creator", ""),
+            "producer": metadata.get("producer", ""),
+        }
+
 
 # ──────────────────────────────────────────────────────────────
 #  PDFTab
@@ -1530,8 +1568,8 @@ class PDFTab(QWidget):
         root.addWidget(self._ann_toolbar)
 
         # main area: sidebar tabs | viewer
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        root.addWidget(splitter)
+        self._splitter = QSplitter(Qt.Orientation.Horizontal)
+        root.addWidget(self._splitter)
 
         # ── sidebar ────────────────────────────────
         self._panel_tabs = QTabWidget()
@@ -1553,16 +1591,16 @@ class PDFTab(QWidget):
         self._bookmarks.navigate_bookmark.connect(self._on_bookmark_navigate)
         self._panel_tabs.addTab(self._bookmarks, "Bookmarks")
 
-        splitter.addWidget(self._panel_tabs)
+        self._splitter.addWidget(self._panel_tabs)
 
         # ── viewer ─────────────────────────────────
         self._viewer = PDFViewer()
         self._viewer.page_changed.connect(self._on_page_changed)
         self._viewer.annotation_added.connect(self._on_annotation_added)
-        splitter.addWidget(self._viewer)
+        self._splitter.addWidget(self._viewer)
 
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
+        self._splitter.setStretchFactor(0, 0)
+        self._splitter.setStretchFactor(1, 1)
 
     # ── document loading ──────────────────────────────────────
 
@@ -1780,6 +1818,22 @@ class PDFTab(QWidget):
         self._panel_tabs.setCurrentWidget(self._search_panel)
         self._search_panel.focus_search()
 
+    def toggle_sidebar(self) -> None:
+        """Show or hide the left sidebar with pages/search/bookmarks panels."""
+        self._panel_tabs.setVisible(not self._panel_tabs.isVisible())
+
+    def get_current_page_text(self) -> str:
+        """Return extracted text of the currently visible page."""
+        if not self._doc:
+            return ""
+        return self._doc.get_text(self._viewer.current_page())
+
+    def get_all_text(self) -> str:
+        """Return extracted text from all pages in this document."""
+        if not self._doc:
+            return ""
+        return self._doc.get_all_text()
+
     # ── properties ────────────────────────────────────────────
 
     @property
@@ -1895,6 +1949,13 @@ class MainWindow(QMainWindow):
         m = mb.addMenu("&Edit")
         self._add_action(m, "&Find…",       "Ctrl+F", self.focus_search)
         self._add_action(m, "Go to &Page…", "Ctrl+G", self.goto_page_dialog)
+        m.addSeparator()
+        self._add_action(
+            m, "Copy Current Page Text", "Ctrl+Shift+C", self.copy_current_page_text
+        )
+        self._add_action(
+            m, "Copy All Document Text", "", self.copy_all_document_text
+        )
 
     def _setup_view_menu(self, mb) -> None:
         """Populate the View menu including page-mode sub-menu and theme toggle."""
@@ -1924,6 +1985,7 @@ class MainWindow(QMainWindow):
         m.addAction(self._dark_action)
         m.addSeparator()
         self._add_action(m, "&Refresh", "F5", self._refresh_current)
+        self._add_action(m, "Toggle &Sidebar", "Ctrl+B", self.toggle_sidebar)
         fs_act = QAction("&Fullscreen", self)
         fs_act.setShortcut(QKeySequence("F11"))
         fs_act.setCheckable(True)
@@ -1958,6 +2020,9 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         self._add_action(m, "Export Page as &Image…", "", self.export_page_image)
         self._add_action(m, "Export &All Pages…",     "", self.export_all_images)
+        m.addSeparator()
+        self._add_action(m, "Document &Info…", "", self.show_document_info)
+        self._add_action(m, "&Optimize PDF…", "", self.optimize_current_pdf)
 
     def _setup_help_menu(self, mb) -> None:
         """Populate the Help menu."""
@@ -2091,6 +2156,12 @@ class MainWindow(QMainWindow):
         if tab:
             tab.focus_search()
 
+    def toggle_sidebar(self) -> None:
+        """Toggle visibility of the active tab sidebar panels."""
+        tab = self._current_tab()
+        if tab:
+            tab.toggle_sidebar()
+
     def goto_page_dialog(self) -> None:
         """Show an input dialog to jump to a specific page."""
         tab = self._current_tab()
@@ -2175,6 +2246,24 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 QMessageBox.critical(self, "Error", str(exc))
 
+    def copy_current_page_text(self) -> None:
+        """Copy extracted text of the current page to the clipboard."""
+        tab = self._current_tab()
+        if not tab:
+            return
+        text = tab.get_current_page_text()
+        QApplication.clipboard().setText(text)
+        self._show_status("Current page text copied to clipboard")
+
+    def copy_all_document_text(self) -> None:
+        """Copy extracted text of the entire document to the clipboard."""
+        tab = self._current_tab()
+        if not tab:
+            return
+        text = tab.get_all_text()
+        QApplication.clipboard().setText(text)
+        self._show_status("Document text copied to clipboard")
+
     def extract_images(self) -> None:
         """Extract embedded images from the active PDF."""
         tab = self._current_tab()
@@ -2231,6 +2320,53 @@ class MainWindow(QMainWindow):
                 )
             except Exception as exc:
                 QMessageBox.critical(self, "Error", str(exc))
+
+    def show_document_info(self) -> None:
+        """Show an information dialog with metadata and file statistics."""
+        tab = self._current_tab()
+        if not tab:
+            return
+        try:
+            info = Manager.get_document_info(tab.path)
+            lines = [
+                f"Path: {info['path']}",
+                f"Pages: {info['pages']}",
+                f"File size: {info['size_human']} ({info['size_bytes']} bytes)",
+            ]
+            for key in ("title", "author", "subject", "keywords", "creator", "producer"):
+                val = info.get(key, "")
+                if val:
+                    lines.append(f"{key.capitalize()}: {val}")
+            QMessageBox.information(self, "Document Info", "\n".join(lines))
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", str(exc))
+
+    def optimize_current_pdf(self) -> None:
+        """Write an optimised copy of the current PDF and optionally open it."""
+        tab = self._current_tab()
+        if not tab:
+            return
+        default = str(Path(tab.path).with_name(Path(tab.path).stem + "_optimized.pdf"))
+        out, _ = QFileDialog.getSaveFileName(
+            self, "Save Optimized PDF", default, "PDF Files (*.pdf)"
+        )
+        if not out:
+            return
+        try:
+            Manager.optimize_pdf(tab.path, out)
+            QMessageBox.information(self, "Done", f"Optimized PDF saved to:\n{out}")
+            if (
+                QMessageBox.question(
+                    self,
+                    "Open Optimized PDF?",
+                    "Open the optimized PDF in a new tab?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                == QMessageBox.StandardButton.Yes
+            ):
+                self.open_file(out)
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", str(exc))
 
     # ── page operations (menu → PDFTab delegates) ─────────────
 
@@ -2417,10 +2553,20 @@ class MainWindow(QMainWindow):
             act.setToolTip(path)
             act.triggered.connect(lambda _, p=path: self.open_file(p))
             self._recent_menu.addAction(act)
+        if existing:
+            self._recent_menu.addSeparator()
+            clear_action = QAction("Clear Recent Files", self)
+            clear_action.triggered.connect(self._clear_recent_files)
+            self._recent_menu.addAction(clear_action)
         if not existing:
             placeholder = QAction("(No recent files)", self)
             placeholder.setEnabled(False)
             self._recent_menu.addAction(placeholder)
+
+    def _clear_recent_files(self) -> None:
+        """Clear recently opened file paths."""
+        self._settings.clear_recent()
+        self._update_recent_menu()
 
     def _refresh_current(self) -> None:
         tab = self._current_tab()
