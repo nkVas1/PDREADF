@@ -138,6 +138,16 @@ class TestSettings:
         s = Settings()  # must not raise
         assert s.theme in ("dark", "light")
 
+    def test_clear_recent_empties_recent_files(self, tmp_path: Path, monkeypatch) -> None:
+        """clear_recent() must remove all entries from recent_files."""
+        monkeypatch.setattr(Settings, "_FILE", tmp_path / ".s.json")
+        s = Settings()
+        s.add_recent("/a.pdf")
+        s.add_recent("/b.pdf")
+        assert len(s.recent_files) == 2
+        s.clear_recent()
+        assert s.recent_files == []
+
 
 # ---------------------------------------------------------------------------
 # Utils
@@ -569,3 +579,24 @@ class TestManager:
         assert n == 3
         assert len(list(Path(out_dir).glob("*.png"))) == 3
         doc.close()
+
+    def test_optimize_pdf_writes_output(self, tmp_path: Path) -> None:
+        """optimize_pdf must produce a valid output PDF."""
+        src = make_test_pdf(str(tmp_path / "src.pdf"), page_count=2)
+        out = str(tmp_path / "optimized.pdf")
+        written = Manager.optimize_pdf(src, out)
+        assert written == out
+        assert os.path.isfile(out)
+        doc = fitz.open(out)
+        assert len(doc) == 2
+        doc.close()
+
+    def test_get_document_info_returns_expected_fields(self, tmp_path: Path) -> None:
+        """get_document_info must report path, pages and file size fields."""
+        src = make_test_pdf(str(tmp_path / "src.pdf"), page_count=4)
+        info = Manager.get_document_info(src)
+        assert info["path"] == src
+        assert info["pages"] == 4
+        assert isinstance(info["size_bytes"], int)
+        assert info["size_bytes"] > 0
+        assert isinstance(info["size_human"], str)
