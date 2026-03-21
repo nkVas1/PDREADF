@@ -11,14 +11,15 @@ License: MIT
 """
 from __future__ import annotations
 
+import copy
 import io
 import json
+import multiprocessing
 import os
 import re
 import shutil
 import sys
 import tempfile
-import copy
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -3387,7 +3388,6 @@ def main() -> None:
     ``multiprocessing.freeze_support()`` so that child-process spawning
     (if ever used) works correctly on Windows.
     """
-    import multiprocessing
     multiprocessing.freeze_support()
 
     app = QApplication(sys.argv)
