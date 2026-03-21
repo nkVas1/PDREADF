@@ -14,6 +14,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -65,12 +66,14 @@ from PyQt6.QtPrintSupport import QPrintDialog, QPrinter
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QColorDialog,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QDockWidget,
     QFileDialog,
+    QFormLayout,
     QFrame,
     QGroupBox,
     QHBoxLayout,
@@ -80,6 +83,7 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressDialog,
     QPushButton,
@@ -93,6 +97,8 @@ from PyQt6.QtWidgets import (
     QTextEdit,
     QToolBar,
     QToolButton,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -265,6 +271,13 @@ class Utils:
         )
 
     @staticmethod
+    def invert_pixmap(pixmap: QPixmap) -> QPixmap:
+        """Return a colour-inverted copy of *pixmap* for night/reading mode."""
+        img = pixmap.toImage()
+        img.invertPixels(QImage.InvertMode.InvertRgb)
+        return QPixmap.fromImage(img)
+
+    @staticmethod
     def ensure_dir(path: str) -> str:
         """Create *path* (and parents) if absent; return *path*."""
         os.makedirs(path, exist_ok=True)
@@ -291,16 +304,25 @@ class PDFDocument:
     to avoid redundant re-renders when navigating between pages.
     """
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, password: str = "") -> None:
         """Open the PDF at *path*.
 
-        Raises :class:`Exception` (propagated from fitz) if the file cannot
-        be opened.
+        If the document is encrypted, *password* is supplied to fitz before
+        attempting to read.
+
+        Raises:
+            ValueError: If the document is encrypted and *password* is wrong.
+            Exception: If fitz cannot open the file for any other reason.
         """
         self.path: str = path
         self._doc: fitz.Document = fitz.open(path)
+        if self._doc.is_encrypted:
+            if not self._doc.authenticate(password):
+                self._doc.close()
+                raise ValueError("Incorrect password for encrypted PDF.")
         self._cache: Dict[Tuple[int, float], QPixmap] = {}
         self._modified: bool = False
+        self._night_mode: bool = False
 
     # ── page access ───────────────────────────────────────────
 
@@ -320,11 +342,18 @@ class PDFDocument:
     # ── rendering ─────────────────────────────────────────────
 
     def render_page(self, index: int, zoom: float = 1.0) -> QPixmap:
-        """Render page *index* at *zoom* to a :class:`QPixmap` (cached)."""
-        key = (index, round(zoom, 4))
+        """Render page *index* at *zoom* to a :class:`QPixmap` (cached).
+
+        In night mode the rendered pixmap colours are inverted for
+        comfortable low-light reading.
+        """
+        key = (index, round(zoom, 4), self._night_mode)
         if key not in self._cache:
             page = self._doc[index]
-            self._cache[key] = Utils.pixmap_from_page(page, zoom)
+            pix = Utils.pixmap_from_page(page, zoom)
+            if self._night_mode:
+                pix = Utils.invert_pixmap(pix)
+            self._cache[key] = pix
         return self._cache[key]
 
     def invalidate_cache(self, index: Optional[int] = None) -> None:
@@ -337,15 +366,28 @@ class PDFDocument:
 
     # ── text & search ─────────────────────────────────────────
 
-    def search(self, query: str, page_index: int) -> List[fitz.Rect]:
-        """Return a list of :class:`fitz.Rect` matching *query* on *page_index*."""
-        return self._doc[page_index].search_for(query)
+    def search(self, query: str, page_index: int,
+               case_sensitive: bool = False) -> List[fitz.Rect]:
+        """Return a list of :class:`fitz.Rect` matching *query* on *page_index*.
 
-    def search_all(self, query: str) -> Dict[int, List[fitz.Rect]]:
+        When *case_sensitive* is ``False`` (the default) the query string is
+        wrapped with a case-insensitive regex so that, e.g., searching for
+        "hello" also matches "Hello" and "HELLO".
+        """
+        if case_sensitive:
+            return self._doc[page_index].search_for(query)
+        # Build a case-insensitive regex pattern
+        escaped = re.escape(query)
+        return self._doc[page_index].search_for(
+            escaped, quads=False, flags=re.IGNORECASE
+        )
+
+    def search_all(self, query: str,
+                   case_sensitive: bool = False) -> Dict[int, List[fitz.Rect]]:
         """Search *query* across all pages; return ``{page_index: [rects]}``."""
         results: Dict[int, List[fitz.Rect]] = {}
         for i in range(self.page_count()):
-            rects = self.search(query, i)
+            rects = self.search(query, i, case_sensitive=case_sensitive)
             if rects:
                 results[i] = rects
         return results
@@ -364,6 +406,59 @@ class PDFDocument:
     def get_toc(self) -> List[Tuple]:
         """Return the document table of contents as ``[(level, title, page)]``."""
         return self._doc.get_toc()
+
+    def get_annotations(self, page_index: int) -> List[Dict[str, Any]]:
+        """Return a list of annotation info dicts for *page_index*.
+
+        Each dict contains ``type``, ``content``, and ``rect`` keys.
+        """
+        page = self._doc[page_index]
+        result: List[Dict[str, Any]] = []
+        for annot in page.annots():
+            result.append({
+                "type": annot.type[1],
+                "content": annot.info.get("content", ""),
+                "rect": annot.rect,
+                "page": page_index,
+            })
+        return result
+
+    def get_all_annotations(self) -> List[Dict[str, Any]]:
+        """Return all annotations across every page."""
+        all_annots: List[Dict[str, Any]] = []
+        for i in range(self.page_count()):
+            all_annots.extend(self.get_annotations(i))
+        return all_annots
+
+    def get_metadata(self) -> Dict[str, str]:
+        """Return a copy of the document metadata dictionary."""
+        meta = self._doc.metadata or {}
+        return {
+            "title":    meta.get("title", ""),
+            "author":   meta.get("author", ""),
+            "subject":  meta.get("subject", ""),
+            "keywords": meta.get("keywords", ""),
+            "creator":  meta.get("creator", ""),
+            "producer": meta.get("producer", ""),
+        }
+
+    def set_metadata(self, metadata: Dict[str, str]) -> None:
+        """Write new metadata to the fitz document (marks as modified)."""
+        self._doc.set_metadata(metadata)
+        self._modified = True
+
+    # ── night mode ────────────────────────────────────────────
+
+    @property
+    def night_mode(self) -> bool:
+        """``True`` when night/dark reading mode is active."""
+        return self._night_mode
+
+    @night_mode.setter
+    def night_mode(self, value: bool) -> None:
+        """Toggle night mode and flush the render cache."""
+        self._night_mode = value
+        self._cache.clear()
 
     # ── save / close ──────────────────────────────────────────
 
@@ -431,7 +526,8 @@ class ThumbnailPanel(QWidget):
     """Sidebar panel showing page thumbnails in a vertical list.
 
     Thumbnails can be clicked to navigate to a page, and dragged to
-    reorder pages inside the document.
+    reorder pages inside the document.  Right-clicking a thumbnail shows
+    a context menu with page-level operations.
     """
 
     page_selected: pyqtSignal = pyqtSignal(int)
@@ -439,6 +535,13 @@ class ThumbnailPanel(QWidget):
 
     pages_reordered: pyqtSignal = pyqtSignal(list)
     """Emitted with the new page-index order after a drag-drop reorder."""
+
+    context_action: pyqtSignal = pyqtSignal(str, int)
+    """Emitted as ``(action_name, page_index)`` from the right-click menu.
+
+    *action_name* is one of ``'rotate_cw'``, ``'rotate_ccw'``,
+    ``'delete'``, or ``'add_blank'``.
+    """
 
     THUMB_W = 120
     THUMB_H = 155
@@ -471,6 +574,8 @@ class ThumbnailPanel(QWidget):
         self._list.setDefaultDropAction(Qt.DropAction.MoveAction)
         self._list.currentRowChanged.connect(self._on_row_changed)
         self._list.model().rowsMoved.connect(self._on_rows_moved)
+        self._list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._list.customContextMenuRequested.connect(self._show_context_menu)
         layout.addWidget(self._list)
 
         self.setMinimumWidth(self.THUMB_W + 30)
@@ -518,6 +623,25 @@ class ThumbnailPanel(QWidget):
             orig = self._list.item(i).data(Qt.ItemDataRole.UserRole)
             new_order.append(orig)
         self.pages_reordered.emit(new_order)
+
+    def _show_context_menu(self, pos: QPoint) -> None:
+        """Display a right-click context menu for thumbnail-level operations."""
+        item = self._list.itemAt(pos)
+        if item is None:
+            return
+        row = self._list.row(item)
+        menu = QMenu(self)
+        menu.addAction("↻  Rotate 90° Clockwise",
+                       lambda: self.context_action.emit("rotate_cw", row))
+        menu.addAction("↺  Rotate 90° Counter-clockwise",
+                       lambda: self.context_action.emit("rotate_ccw", row))
+        menu.addSeparator()
+        menu.addAction("＋ Add Blank Page After",
+                       lambda: self.context_action.emit("add_blank", row))
+        menu.addSeparator()
+        menu.addAction("✕  Delete This Page",
+                       lambda: self.context_action.emit("delete", row))
+        menu.exec(self._list.mapToGlobal(pos))
 
 
 # ──────────────────────────────────────────────────────────────
@@ -730,6 +854,147 @@ class BookmarkPanel(QWidget):
 
 
 # ──────────────────────────────────────────────────────────────
+#  OutlinePanel  (document TOC / bookmarks tree)
+# ──────────────────────────────────────────────────────────────
+
+class OutlinePanel(QWidget):
+    """Sidebar panel that displays the document outline (table of contents).
+
+    Outline entries are loaded from :meth:`PDFDocument.get_toc` and shown
+    as a nested :class:`QTreeWidget`.  Double-clicking an entry navigates
+    to the corresponding page.
+    """
+
+    navigate_page: pyqtSignal = pyqtSignal(int)
+    """Emitted with the target page index when an outline item is activated."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        """Build the outline tree UI."""
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        title = QLabel("Outline")
+        title.setStyleSheet("font-weight: bold; font-size: 12px;")
+        layout.addWidget(title)
+
+        self._tree = QTreeWidget()
+        self._tree.setHeaderHidden(True)
+        self._tree.setColumnCount(1)
+        self._tree.setRootIsDecorated(True)
+        self._tree.itemDoubleClicked.connect(self._on_item_dbl)
+        layout.addWidget(self._tree)
+
+        self._empty_label = QLabel("No outline in this document.")
+        self._empty_label.setStyleSheet("color: #888; font-size: 10px;")
+        self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty_label.hide()
+        layout.addWidget(self._empty_label)
+
+    def load_document(self, doc: "PDFDocument") -> None:
+        """Populate the tree from *doc*'s table of contents."""
+        self._tree.clear()
+        toc = doc.get_toc()
+        if not toc:
+            self._tree.hide()
+            self._empty_label.show()
+            return
+        self._tree.show()
+        self._empty_label.hide()
+        stack: List[Tuple[int, QTreeWidgetItem]] = []
+        for level, title, page in toc:
+            item = QTreeWidgetItem([title])
+            item.setData(0, Qt.ItemDataRole.UserRole, page - 1)
+            item.setToolTip(0, f"Page {page}")
+            while stack and stack[-1][0] >= level:
+                stack.pop()
+            if stack:
+                stack[-1][1].addChild(item)
+            else:
+                self._tree.addTopLevelItem(item)
+            stack.append((level, item))
+        self._tree.expandAll()
+
+    def clear(self) -> None:
+        """Remove all outline entries."""
+        self._tree.clear()
+
+    def _on_item_dbl(self, item: QTreeWidgetItem, _col: int) -> None:
+        page = item.data(0, Qt.ItemDataRole.UserRole)
+        if page is not None and page >= 0:
+            self.navigate_page.emit(page)
+
+
+# ──────────────────────────────────────────────────────────────
+#  AnnotationPanel  (list all annotations in the document)
+# ──────────────────────────────────────────────────────────────
+
+class AnnotationPanel(QWidget):
+    """Sidebar panel that lists every annotation in the open document.
+
+    Each entry shows the annotation type and the page it appears on.
+    Double-clicking navigates to the relevant page.
+    """
+
+    navigate_page: pyqtSignal = pyqtSignal(int)
+    """Emitted with the page index when an annotation entry is activated."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._annots: List[Dict[str, Any]] = []
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        """Build the annotations list UI."""
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        title = QLabel("Annotations")
+        title.setStyleSheet("font-weight: bold; font-size: 12px;")
+        layout.addWidget(title)
+
+        self._list = QListWidget()
+        self._list.itemDoubleClicked.connect(self._on_item_dbl)
+        layout.addWidget(self._list)
+
+        self._status = QLabel("No annotations")
+        self._status.setStyleSheet("font-size: 10px; color: #888;")
+        layout.addWidget(self._status)
+
+    def load_document(self, doc: "PDFDocument") -> None:
+        """Scan *doc* for annotations and populate the list."""
+        self._annots = doc.get_all_annotations()
+        self._list.clear()
+        for ann in self._annots:
+            label = f"p.{ann['page'] + 1}  [{ann['type']}]"
+            if ann["content"]:
+                label += f"  {ann['content'][:40]}"
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, ann["page"])
+            self._list.addItem(item)
+        n = len(self._annots)
+        self._status.setText(
+            f"{n} annotation{'s' if n != 1 else ''}"
+        )
+
+    def clear(self) -> None:
+        """Remove all annotation entries."""
+        self._list.clear()
+        self._annots.clear()
+        self._status.setText("No annotations")
+
+    def _on_item_dbl(self, item: QListWidgetItem) -> None:
+        page = item.data(Qt.ItemDataRole.UserRole)
+        if page is not None:
+            self.navigate_page.emit(page)
+
+
+# ──────────────────────────────────────────────────────────────
 #  AnnotationToolbar
 # ──────────────────────────────────────────────────────────────
 
@@ -750,6 +1015,7 @@ class AnnotationToolbar(QToolBar):
         ("strikeout",  "Strikeout",  "Strike through a text region"),
         ("freehand",   "Freehand",   "Draw freehand ink lines"),
         ("text",       "Text Note",  "Add a text-note annotation"),
+        ("redact",     "Redact",     "Mark a region for permanent redaction (burn with Apply Redactions)"),
     ]
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
@@ -1367,6 +1633,28 @@ class Annotator:
         annot.update()
 
     @staticmethod
+    def add_redaction(
+        doc: fitz.Document, page_idx: int, rect: fitz.Rect
+    ) -> None:
+        """Add a redaction annotation at *rect* on *page_idx*.
+
+        The redaction is only *marked* at this stage; call
+        :meth:`apply_redactions` to burn it permanently into the document.
+        """
+        page = doc[page_idx]
+        page.add_redact_annot(rect, fill=(0, 0, 0))
+
+    @staticmethod
+    def apply_redactions(doc: fitz.Document) -> None:
+        """Permanently apply all pending redaction annotations in *doc*.
+
+        This replaces the covered content with solid black rectangles and
+        removes the annotation objects from every page.
+        """
+        for page in doc:
+            page.apply_redactions()
+
+    @staticmethod
     def apply_annotation(
         doc: fitz.Document,
         page_idx: int,
@@ -1387,6 +1675,8 @@ class Annotator:
             Annotator.add_strikeout(doc, page_idx, data, color)
         elif tool == "freehand":
             Annotator.add_freehand(doc, page_idx, data, color)
+        elif tool == "redact":
+            Annotator.add_redaction(doc, page_idx, data)
         elif tool == "text":
             text, ok = QInputDialog.getText(
                 parent_widget, "Text Note", "Enter note text:"
@@ -1503,17 +1793,101 @@ class Manager:
         return out
 
     @staticmethod
+    def add_watermark(
+        path: str,
+        text: str,
+        output_path: Optional[str] = None,
+        opacity: float = 0.25,
+        font_size: int = 60,
+        color: Tuple[float, float, float] = (0.5, 0.5, 0.5),
+    ) -> str:
+        """Stamp *text* as a diagonal watermark on every page of *path*.
+
+        The text is rendered at 45° across the page centre using a
+        semi-transparent grey colour.  Saves to *output_path* (or overwrites
+        *path* if ``None``).  Returns the final output path.
+        """
+        out = output_path or path
+        with fitz.open(path) as doc:
+            for page in doc:
+                r = page.rect
+                cx, cy = r.width / 2, r.height / 2
+                tw = fitz.TextWriter(r, opacity=opacity)
+                font = fitz.Font("helv")
+                text_len = font.text_length(text, fontsize=font_size)
+                # Centre the starting point
+                start = fitz.Point(cx - text_len / 2, cy)
+                tw.append(start, text, font=font, fontsize=font_size)
+                # Rotate 45° around the page centre
+                morph = (
+                    fitz.Point(cx, cy),
+                    fitz.Matrix(45),
+                )
+                tw.write_text(page, morph=morph, color=color)
+            doc.save(out, garbage=4, deflate=True)
+        return out
+
+    @staticmethod
+    def protect_pdf(
+        path: str,
+        user_password: str,
+        owner_password: str,
+        output_path: Optional[str] = None,
+    ) -> str:
+        """Encrypt *path* with *user_password* and *owner_password*.
+
+        Returns the path to the written encrypted file.
+        """
+        out = output_path or path
+        with pikepdf.open(path) as pdf:
+            encryption = pikepdf.Encryption(
+                user=user_password,
+                owner=owner_password,
+                allow=pikepdf.Permissions(
+                    accessibility=True,
+                    extract=True,
+                    modify_annotation=True,
+                    modify_assembly=False,
+                    modify_form=True,
+                    modify_other=False,
+                    print_lowres=True,
+                    print_highres=True,
+                ),
+            )
+            pdf.save(out, encryption=encryption)
+        return out
+
+    @staticmethod
+    def remove_password(
+        path: str,
+        password: str,
+        output_path: Optional[str] = None,
+    ) -> str:
+        """Remove encryption from a password-protected PDF.
+
+        Returns the path to the unencrypted output file.
+        """
+        out = output_path or path
+        with pikepdf.open(path, password=password) as pdf:
+            pdf.save(out, encryption=False)
+        return out
+
+    @staticmethod
     def get_document_info(path: str) -> Dict[str, Any]:
         """Return document summary info useful for a quick diagnostics dialog."""
         with fitz.open(path) as doc:
             metadata = doc.metadata or {}
             pages = len(doc)
+            is_encrypted = doc.is_encrypted
+            perm = doc.permissions
         size_bytes = os.path.getsize(path)
         return {
             "path": path,
             "pages": pages,
             "size_bytes": size_bytes,
             "size_human": Utils.human_size(size_bytes),
+            "is_encrypted": is_encrypted,
+            "permissions": perm,
             "title": metadata.get("title", ""),
             "author": metadata.get("author", ""),
             "subject": metadata.get("subject", ""),
@@ -1546,13 +1920,15 @@ class PDFTab(QWidget):
         path: str,
         settings: Settings,
         parent: Optional[QWidget] = None,
+        password: str = "",
     ) -> None:
         super().__init__(parent)
         self._path     = path
         self._settings = settings
+        self._password = password
         self._doc: Optional[PDFDocument] = None
         self._setup_ui()
-        self._load_document(path)
+        self._load_document(path, password=password)
 
     # ── setup ─────────────────────────────────────────────────
 
@@ -1579,6 +1955,7 @@ class PDFTab(QWidget):
         self._thumbnails = ThumbnailPanel()
         self._thumbnails.page_selected.connect(self._on_thumb_selected)
         self._thumbnails.pages_reordered.connect(self._on_pages_reordered)
+        self._thumbnails.context_action.connect(self._on_thumbnail_context_action)
         self._panel_tabs.addTab(self._thumbnails, "Pages")
 
         self._search_panel = SearchPanel()
@@ -1590,6 +1967,14 @@ class PDFTab(QWidget):
         self._bookmarks.set_current_page_fn(lambda: self._viewer.current_page())
         self._bookmarks.navigate_bookmark.connect(self._on_bookmark_navigate)
         self._panel_tabs.addTab(self._bookmarks, "Bookmarks")
+
+        self._outline_panel = OutlinePanel()
+        self._outline_panel.navigate_page.connect(self._on_outline_navigate)
+        self._panel_tabs.addTab(self._outline_panel, "Outline")
+
+        self._annotation_panel = AnnotationPanel()
+        self._annotation_panel.navigate_page.connect(self._on_outline_navigate)
+        self._panel_tabs.addTab(self._annotation_panel, "Annots")
 
         self._splitter.addWidget(self._panel_tabs)
 
@@ -1604,14 +1989,16 @@ class PDFTab(QWidget):
 
     # ── document loading ──────────────────────────────────────
 
-    def _load_document(self, path: str) -> None:
-        """Open *path* and populate the viewer and thumbnail panel."""
+    def _load_document(self, path: str, password: str = "") -> None:
+        """Open *path* and populate the viewer and all sidebar panels."""
         try:
-            self._doc = PDFDocument(path)
+            self._doc = PDFDocument(path, password=password)
             self._viewer.load_document(self._doc)
             self._viewer.set_zoom(self._settings.zoom)
             self._viewer.set_page_mode(self._settings.page_mode)
             self._thumbnails.load_document(self._doc)
+            self._outline_panel.load_document(self._doc)
+            self._annotation_panel.load_document(self._doc)
             self.title_changed.emit(Path(path).name)
             self.status_message.emit(
                 f"Opened: {Path(path).name}  ·  {self._doc.page_count()} pages"
@@ -1624,10 +2011,12 @@ class PDFTab(QWidget):
         current = self._viewer.current_page()
         if self._doc:
             self._doc.close()
-        self._doc = PDFDocument(self._path)
+        self._doc = PDFDocument(self._path, password=self._password)
         self._viewer.load_document(self._doc)
         self._viewer.set_zoom(self._settings.zoom)
         self._thumbnails.load_document(self._doc)
+        self._outline_panel.load_document(self._doc)
+        self._annotation_panel.load_document(self._doc)
         safe_page = min(current, self._doc.page_count() - 1)
         self._viewer.goto_page(safe_page)
 
@@ -1659,6 +2048,37 @@ class PDFTab(QWidget):
         self._viewer.goto_page(page_idx)
         self._thumbnails.set_current_page(page_idx)
 
+    def _on_outline_navigate(self, page_idx: int) -> None:
+        """Navigate to *page_idx* from the outline or annotation panel."""
+        self._viewer.goto_page(page_idx)
+        self._thumbnails.set_current_page(page_idx)
+
+    def _on_thumbnail_context_action(self, action: str, page_idx: int) -> None:
+        """Handle context-menu actions fired from :class:`ThumbnailPanel`.
+
+        All operations target *page_idx* (the right-clicked thumbnail), so we
+        first navigate the viewer to that page before delegating to the
+        per-tab helpers that work on ``current_page``.
+        """
+        # Navigate to the target page so that rotate/delete affect the correct page
+        self._viewer.goto_page(page_idx)
+        self._thumbnails.set_current_page(page_idx)
+
+        if action == "rotate_cw":
+            self.rotate_current_page(90)
+        elif action == "rotate_ccw":
+            self.rotate_current_page(270)
+        elif action == "delete":
+            self.delete_current_page()
+        elif action == "add_blank":
+            if self._doc:
+                try:
+                    Editor.add_blank_page(self._path, after_index=page_idx)
+                    self._reload_document()
+                    self.status_message.emit("Blank page added")
+                except Exception as exc:
+                    QMessageBox.critical(self, "Error", str(exc))
+
     # ── viewer slots ──────────────────────────────────────────
 
     def _on_page_changed(self, index: int) -> None:
@@ -1687,6 +2107,7 @@ class PDFTab(QWidget):
                 self._doc._modified = True
                 self._viewer._canvas.update()
                 self._thumbnails.refresh_page(self._doc, page_idx)
+                self._annotation_panel.load_document(self._doc)
         except Exception as exc:
             QMessageBox.warning(self, "Annotation Error", str(exc))
 
@@ -1822,6 +2243,56 @@ class PDFTab(QWidget):
         """Show or hide the left sidebar with pages/search/bookmarks panels."""
         self._panel_tabs.setVisible(not self._panel_tabs.isVisible())
 
+    def toggle_night_mode(self) -> None:
+        """Toggle night/dark reading mode (inverted page colours)."""
+        if not self._doc:
+            return
+        self._doc.night_mode = not self._doc.night_mode
+        self._doc.invalidate_cache()
+        self._viewer._canvas.update()
+        state = "ON" if self._doc.night_mode else "OFF"
+        self.status_message.emit(f"Night mode {state}")
+
+    def apply_redactions(self) -> None:
+        """Permanently burn all pending redaction annotations into the PDF.
+
+        The document is first saved with the redactions applied, then
+        reloaded so the viewer reflects the changes.
+        """
+        if not self._doc:
+            return
+        reply = QMessageBox.question(
+            self,
+            "Apply Redactions",
+            "Permanently apply all redaction marks?\n\n"
+            "This action CANNOT be undone – redacted content will be "
+            "irrecoverably removed.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            Annotator.apply_redactions(self._doc.fitz_doc)
+            self._doc.save()
+            self._reload_document()
+            self.status_message.emit("Redactions applied and saved")
+        except Exception as exc:
+            QMessageBox.critical(self, "Redaction Error", str(exc))
+
+    def edit_metadata(self) -> None:
+        """Open a dialog to view and edit the document metadata."""
+        if not self._doc:
+            return
+        meta = self._doc.get_metadata()
+        dlg = MetadataDialog(meta, parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            new_meta = dlg.get_metadata()
+            try:
+                self._doc.set_metadata(new_meta)
+                self.status_message.emit("Metadata updated (save to persist)")
+            except Exception as exc:
+                QMessageBox.critical(self, "Metadata Error", str(exc))
+
     def get_current_page_text(self) -> str:
         """Return extracted text of the currently visible page."""
         if not self._doc:
@@ -1853,6 +2324,55 @@ class PDFTab(QWidget):
 
 
 # ──────────────────────────────────────────────────────────────
+#  MetadataDialog
+# ──────────────────────────────────────────────────────────────
+
+class MetadataDialog(QDialog):
+    """Modal dialog for viewing and editing PDF document metadata."""
+
+    _FIELDS: List[Tuple[str, str]] = [
+        ("title",    "Title"),
+        ("author",   "Author"),
+        ("subject",  "Subject"),
+        ("keywords", "Keywords"),
+        ("creator",  "Creator"),
+        ("producer", "Producer"),
+    ]
+
+    def __init__(
+        self,
+        metadata: Dict[str, str],
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Document Metadata")
+        self.setMinimumWidth(460)
+        self._inputs: Dict[str, QLineEdit] = {}
+        self._setup_ui(metadata)
+
+    def _setup_ui(self, metadata: Dict[str, str]) -> None:
+        """Build the form layout."""
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        for key, label in self._FIELDS:
+            edit = QLineEdit(metadata.get(key, ""))
+            form.addRow(f"{label}:", edit)
+            self._inputs[key] = edit
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_metadata(self) -> Dict[str, str]:
+        """Return the edited metadata as a dictionary."""
+        return {key: self._inputs[key].text() for key, _ in self._FIELDS}
+
+
+# ──────────────────────────────────────────────────────────────
 #  MainWindow
 # ──────────────────────────────────────────────────────────────
 
@@ -1864,7 +2384,7 @@ class MainWindow(QMainWindow):
     """
 
     APP_NAME    = "PDREADF"
-    APP_VERSION = "1.0.0"
+    APP_VERSION = "1.1.0"
 
     def __init__(self) -> None:
         super().__init__()
@@ -1886,7 +2406,7 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
 
     def _setup_tabs(self) -> None:
-        """Create the central QTabWidget and a welcome placeholder."""
+        """Create the central QTabWidget and an enhanced welcome placeholder."""
         self._tabs = QTabWidget()
         self._tabs.setTabsClosable(True)
         self._tabs.setMovable(True)
@@ -1895,18 +2415,45 @@ class MainWindow(QMainWindow):
         self._tabs.currentChanged.connect(self._on_tab_changed)
         self.setCentralWidget(self._tabs)
 
-        self._welcome = QLabel(
-            "<h2>Welcome to PDREADF</h2>"
-            "<p>Open a PDF with <b>File → Open</b> (Ctrl+O)<br>"
-            "or drag &amp; drop PDF files onto this window.</p>"
-        )
-        self._welcome.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._welcome.setStyleSheet("color: #888; font-size: 14px;")
+        self._welcome = self._build_welcome_widget()
         self._tabs.addTab(self._welcome, "Welcome")
         # hide the close button on the welcome tab
         self._tabs.tabBar().setTabButton(
             0, self._tabs.tabBar().ButtonPosition.RightSide, None
         )
+
+    def _build_welcome_widget(self) -> QWidget:
+        """Build a rich welcome widget that lists recent files."""
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        heading = QLabel(
+            f"<h1 style='color:#569CD6;'>{self.APP_NAME}</h1>"
+            f"<p style='color:#888; font-size:14px;'>Professional PDF Reader &amp; Editor  v{self.APP_VERSION}</p>"
+            "<p style='color:#aaa;'>Open a PDF with <b>File → Open</b> (Ctrl+O)<br>"
+            "or drag &amp; drop PDF files onto this window.</p>"
+        )
+        heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(heading)
+
+        recent = [p for p in self._settings.recent_files if os.path.isfile(p)]
+        if recent:
+            lbl = QLabel("<b style='color:#aaa;'>Recent Files:</b>")
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(lbl)
+            for path in recent[:8]:
+                btn = QPushButton(f"  {Path(path).name}")
+                btn.setToolTip(path)
+                btn.setFlat(True)
+                btn.setStyleSheet(
+                    "text-align:left; color:#569CD6; font-size:13px;"
+                    "padding:4px 8px; border:none;"
+                )
+                btn.clicked.connect(lambda _, p=path: self.open_file(p))
+                layout.addWidget(btn)
+
+        return container
 
     def _setup_statusbar(self) -> None:
         """Create status bar with message and zoom labels."""
@@ -1983,6 +2530,13 @@ class MainWindow(QMainWindow):
             lambda checked: self._apply_theme("dark" if checked else "light")
         )
         m.addAction(self._dark_action)
+
+        self._night_action = QAction("&Night Reading Mode", self)
+        self._night_action.setCheckable(True)
+        self._night_action.setShortcut(QKeySequence("Ctrl+N"))
+        self._night_action.triggered.connect(self._toggle_night_mode)
+        m.addAction(self._night_action)
+
         m.addSeparator()
         self._add_action(m, "&Refresh", "F5", self._refresh_current)
         self._add_action(m, "Toggle &Sidebar", "Ctrl+B", self.toggle_sidebar)
@@ -2021,8 +2575,15 @@ class MainWindow(QMainWindow):
         self._add_action(m, "Export Page as &Image…", "", self.export_page_image)
         self._add_action(m, "Export &All Pages…",     "", self.export_all_images)
         m.addSeparator()
-        self._add_action(m, "Document &Info…", "", self.show_document_info)
-        self._add_action(m, "&Optimize PDF…", "", self.optimize_current_pdf)
+        self._add_action(m, "Add &Watermark…",        "", self.add_watermark)
+        self._add_action(m, "Apply &Redactions",      "", self.apply_redactions)
+        m.addSeparator()
+        self._add_action(m, "Edit &Metadata…",        "", self.edit_metadata)
+        self._add_action(m, "Document &Info…",        "", self.show_document_info)
+        self._add_action(m, "&Optimize PDF…",         "", self.optimize_current_pdf)
+        m.addSeparator()
+        self._add_action(m, "&Protect PDF…",          "", self.protect_pdf)
+        self._add_action(m, "&Remove Password…",      "", self.remove_password)
 
     def _setup_help_menu(self, mb) -> None:
         """Populate the Help menu."""
@@ -2321,6 +2882,109 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 QMessageBox.critical(self, "Error", str(exc))
 
+    def add_watermark(self) -> None:
+        """Show a dialog to add a text watermark to the active document."""
+        tab = self._current_tab()
+        if not tab:
+            return
+        text, ok = QInputDialog.getText(
+            self, "Add Watermark", "Watermark text:", text="CONFIDENTIAL"
+        )
+        if not ok or not text:
+            return
+        default = str(Path(tab.path).with_name(
+            Path(tab.path).stem + "_watermarked.pdf"
+        ))
+        out, _ = QFileDialog.getSaveFileName(
+            self, "Save Watermarked PDF", default, "PDF Files (*.pdf)"
+        )
+        if not out:
+            return
+        try:
+            Manager.add_watermark(tab.path, text, output_path=out)
+            QMessageBox.information(self, "Done", f"Watermarked PDF saved to:\n{out}")
+            if (
+                QMessageBox.question(
+                    self, "Open?", "Open the watermarked PDF?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                ) == QMessageBox.StandardButton.Yes
+            ):
+                self.open_file(out)
+        except Exception as exc:
+            QMessageBox.critical(self, "Watermark Error", str(exc))
+
+    def apply_redactions(self) -> None:
+        """Apply pending redactions in the active tab."""
+        tab = self._current_tab()
+        if tab:
+            tab.apply_redactions()
+
+    def edit_metadata(self) -> None:
+        """Open metadata editor for the active tab."""
+        tab = self._current_tab()
+        if tab:
+            tab.edit_metadata()
+
+    def protect_pdf(self) -> None:
+        """Add password protection to the active PDF."""
+        tab = self._current_tab()
+        if not tab:
+            return
+        user_pwd, ok = QInputDialog.getText(
+            self, "Protect PDF", "User password (required to open):",
+            QLineEdit.EchoMode.Password
+        )
+        if not ok:
+            return
+        owner_pwd, ok2 = QInputDialog.getText(
+            self, "Protect PDF", "Owner password (required to modify):",
+            QLineEdit.EchoMode.Password
+        )
+        if not ok2:
+            return
+        default = str(Path(tab.path).with_name(
+            Path(tab.path).stem + "_protected.pdf"
+        ))
+        out, _ = QFileDialog.getSaveFileName(
+            self, "Save Protected PDF", default, "PDF Files (*.pdf)"
+        )
+        if not out:
+            return
+        try:
+            Manager.protect_pdf(tab.path, user_pwd, owner_pwd, output_path=out)
+            QMessageBox.information(
+                self, "Done", f"Password-protected PDF saved to:\n{out}"
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Protection Error", str(exc))
+
+    def remove_password(self) -> None:
+        """Remove password protection from the active PDF."""
+        tab = self._current_tab()
+        if not tab:
+            return
+        pwd, ok = QInputDialog.getText(
+            self, "Remove Password", "Current password:",
+            QLineEdit.EchoMode.Password
+        )
+        if not ok:
+            return
+        default = str(Path(tab.path).with_name(
+            Path(tab.path).stem + "_unlocked.pdf"
+        ))
+        out, _ = QFileDialog.getSaveFileName(
+            self, "Save Unlocked PDF", default, "PDF Files (*.pdf)"
+        )
+        if not out:
+            return
+        try:
+            Manager.remove_password(tab.path, pwd, output_path=out)
+            QMessageBox.information(
+                self, "Done", f"Unlocked PDF saved to:\n{out}"
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Remove Password Error", str(exc))
+
     def show_document_info(self) -> None:
         """Show an information dialog with metadata and file statistics."""
         tab = self._current_tab()
@@ -2332,6 +2996,7 @@ class MainWindow(QMainWindow):
                 f"Path: {info['path']}",
                 f"Pages: {info['pages']}",
                 f"File size: {info['size_human']} ({info['size_bytes']} bytes)",
+                f"Encrypted: {'Yes' if info.get('is_encrypted') else 'No'}",
             ]
             for key in ("title", "author", "subject", "keywords", "creator", "producer"):
                 val = info.get(key, "")
@@ -2465,19 +3130,53 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_dark_action"):
             self._dark_action.setChecked(theme == "dark")
 
+    def _toggle_night_mode(self, checked: bool) -> None:
+        """Toggle night reading mode on the active tab."""
+        tab = self._current_tab()
+        if tab:
+            tab.toggle_night_mode()
+        else:
+            # No tab open – uncheck the action
+            if hasattr(self, "_night_action"):
+                self._night_action.setChecked(False)
+
     # ── tab helpers ───────────────────────────────────────────
 
     def _open_tab(self, path: str) -> None:
-        """Open *path* in a new tab, or focus the existing tab if already open."""
+        """Open *path* in a new tab, or focus the existing tab if already open.
+
+        If the document is encrypted, the user is prompted for a password
+        before the tab is created.
+        """
         for i in range(self._tabs.count()):
             w = self._tabs.widget(i)
             if isinstance(w, PDFTab) and w.path == path:
                 self._tabs.setCurrentIndex(i)
                 return
+
+        # Check whether the file needs a password
+        password = ""
+        try:
+            probe = fitz.open(path)
+            if probe.is_encrypted:
+                probe.close()
+                password, ok = QInputDialog.getText(
+                    self,
+                    "Password Required",
+                    f"Enter password for:\n{Path(path).name}",
+                    QLineEdit.EchoMode.Password,
+                )
+                if not ok:
+                    return
+            else:
+                probe.close()
+        except Exception:
+            pass
+
         # remove welcome tab if it's still there
-        if self._tabs.count() == 1 and isinstance(self._tabs.widget(0), QLabel):
+        if self._tabs.count() == 1 and not isinstance(self._tabs.widget(0), PDFTab):
             self._tabs.removeTab(0)
-        tab = PDFTab(path, self._settings)
+        tab = PDFTab(path, self._settings, password=password)
         tab.status_message.connect(self._show_status)
         tab.title_changed.connect(lambda t, _tab=tab: self._update_tab_title(_tab, t))
         idx = self._tabs.addTab(tab, Path(path).name)

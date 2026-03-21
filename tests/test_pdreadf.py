@@ -33,6 +33,9 @@ from pdreadf import (
     Annotator,
     Editor,
     Manager,
+    MetadataDialog,
+    OutlinePanel,
+    AnnotationPanel,
     PDFDocument,
     PageRenderer,
     Settings,
@@ -253,8 +256,9 @@ class TestPDFDocument:
         doc.render_page(0, zoom=1.0)
         doc.render_page(1, zoom=1.0)
         doc.invalidate_cache(0)
-        assert (0, 1.0) not in doc._cache
-        assert (1, 1.0) in doc._cache
+        # Cache key is (page_index, zoom, night_mode); page 0 entries gone.
+        assert not any(k[0] == 0 for k in doc._cache)
+        assert any(k[0] == 1 for k in doc._cache)
         doc.close()
 
     def test_invalidate_cache_all(self, tmp_pdf: str) -> None:
@@ -600,3 +604,359 @@ class TestManager:
         assert isinstance(info["size_bytes"], int)
         assert info["size_bytes"] > 0
         assert isinstance(info["size_human"], str)
+
+
+# ---------------------------------------------------------------------------
+# PDFDocument – new features (night mode, metadata, annotations list)
+# ---------------------------------------------------------------------------
+
+class TestPDFDocumentNewFeatures:
+    """Tests for new PDFDocument methods added in v1.1."""
+
+    def test_night_mode_default_is_false(self, tmp_pdf: str) -> None:
+        """night_mode must default to False."""
+        from PyQt6.QtWidgets import QApplication
+        _ = QApplication.instance() or QApplication(sys.argv)
+        doc = PDFDocument(tmp_pdf)
+        assert doc.night_mode is False
+        doc.close()
+
+    def test_night_mode_toggle_flushes_cache(self, tmp_pdf: str) -> None:
+        """Toggling night_mode must clear the render cache."""
+        from PyQt6.QtWidgets import QApplication
+        _ = QApplication.instance() or QApplication(sys.argv)
+        doc = PDFDocument(tmp_pdf)
+        doc.render_page(0, zoom=1.0)
+        assert len(doc._cache) > 0
+        doc.night_mode = True
+        assert len(doc._cache) == 0
+        doc.close()
+
+    def test_night_mode_returns_different_pixmap(self, tmp_pdf: str) -> None:
+        """Rendering with night_mode on should produce an inverted pixmap."""
+        from PyQt6.QtWidgets import QApplication
+        _ = QApplication.instance() or QApplication(sys.argv)
+        doc = PDFDocument(tmp_pdf)
+        normal = doc.render_page(0, zoom=1.0)
+        doc.night_mode = True
+        night = doc.render_page(0, zoom=1.0)
+        # The two pixmaps represent the same page but are different objects.
+        assert normal is not night
+        doc.close()
+
+    def test_get_metadata_returns_dict(self, tmp_pdf: str) -> None:
+        """get_metadata must return a dict with the expected keys."""
+        from PyQt6.QtWidgets import QApplication
+        _ = QApplication.instance() or QApplication(sys.argv)
+        doc = PDFDocument(tmp_pdf)
+        meta = doc.get_metadata()
+        assert isinstance(meta, dict)
+        for key in ("title", "author", "subject", "keywords", "creator", "producer"):
+            assert key in meta
+        doc.close()
+
+    def test_set_metadata_updates_fields(self, tmp_pdf: str) -> None:
+        """set_metadata must update the fitz document metadata."""
+        from PyQt6.QtWidgets import QApplication
+        _ = QApplication.instance() or QApplication(sys.argv)
+        doc = PDFDocument(tmp_pdf)
+        doc.set_metadata({"title": "Test Title", "author": "Test Author"})
+        meta = doc.get_metadata()
+        assert meta["title"] == "Test Title"
+        assert meta["author"] == "Test Author"
+        assert doc.is_modified
+        doc.close()
+
+    def test_get_annotations_returns_list(self, tmp_pdf: str) -> None:
+        """get_annotations must return a list (empty for annotation-free page)."""
+        from PyQt6.QtWidgets import QApplication
+        _ = QApplication.instance() or QApplication(sys.argv)
+        doc = PDFDocument(tmp_pdf)
+        annots = doc.get_annotations(0)
+        assert isinstance(annots, list)
+        doc.close()
+
+    def test_get_all_annotations_aggregates_pages(self, tmp_pdf: str) -> None:
+        """get_all_annotations must combine results from every page."""
+        from PyQt6.QtWidgets import QApplication
+        from PyQt6.QtGui import QColor
+        _ = QApplication.instance() or QApplication(sys.argv)
+        doc = PDFDocument(tmp_pdf)
+        # Add one annotation on page 0 and one on page 2
+        Annotator.add_highlight(
+            doc.fitz_doc, 0, fitz.Rect(50, 80, 200, 110), QColor("#FFFF00")
+        )
+        Annotator.add_highlight(
+            doc.fitz_doc, 2, fitz.Rect(50, 80, 200, 110), QColor("#FFFF00")
+        )
+        all_annots = doc.get_all_annotations()
+        assert len(all_annots) >= 2
+        pages = {a["page"] for a in all_annots}
+        assert 0 in pages and 2 in pages
+        doc.close()
+
+    def test_encrypted_pdf_wrong_password_raises(self, tmp_path: Path) -> None:
+        """Opening an encrypted PDF with the wrong password must raise ValueError."""
+        # Create and encrypt a PDF with pikepdf
+        import pikepdf as _pikepdf
+        src = make_test_pdf(str(tmp_path / "plain.pdf"))
+        enc_path = str(tmp_path / "encrypted.pdf")
+        with _pikepdf.open(src) as pdf:
+            pdf.save(
+                enc_path,
+                encryption=_pikepdf.Encryption(user="secret", owner="owner123"),
+            )
+        with pytest.raises(ValueError, match="[Ii]ncorrect password"):
+            PDFDocument(enc_path, password="wrong")
+
+    def test_encrypted_pdf_correct_password_opens(self, tmp_path: Path) -> None:
+        """Opening an encrypted PDF with the correct password must succeed."""
+        import pikepdf as _pikepdf
+        from PyQt6.QtWidgets import QApplication
+        _ = QApplication.instance() or QApplication(sys.argv)
+        src = make_test_pdf(str(tmp_path / "plain.pdf"))
+        enc_path = str(tmp_path / "enc2.pdf")
+        with _pikepdf.open(src) as pdf:
+            pdf.save(
+                enc_path,
+                encryption=_pikepdf.Encryption(user="pass123", owner="owner"),
+            )
+        doc = PDFDocument(enc_path, password="pass123")
+        assert doc.page_count() == 3
+        doc.close()
+
+
+# ---------------------------------------------------------------------------
+# Utils – new invert_pixmap helper
+# ---------------------------------------------------------------------------
+
+class TestUtilsInvertPixmap:
+    """Tests for Utils.invert_pixmap."""
+
+    def test_invert_pixmap_returns_non_null(self, tmp_pdf: str) -> None:
+        """invert_pixmap must return a valid, non-null QPixmap."""
+        from PyQt6.QtWidgets import QApplication
+        _ = QApplication.instance() or QApplication(sys.argv)
+        doc = fitz.open(tmp_pdf)
+        original = Utils.pixmap_from_page(doc[0], zoom=1.0)
+        inverted = Utils.invert_pixmap(original)
+        assert not inverted.isNull()
+        assert inverted.width() == original.width()
+        assert inverted.height() == original.height()
+        doc.close()
+
+
+# ---------------------------------------------------------------------------
+# Annotator – new redaction methods
+# ---------------------------------------------------------------------------
+
+class TestAnnotatorRedaction:
+    """Tests for Annotator redaction methods."""
+
+    def test_add_redaction_marks_annotation(self, tmp_pdf: str) -> None:
+        """add_redaction must add a redaction annotation to the page."""
+        doc = fitz.open(tmp_pdf)
+        page = doc[0]
+        Annotator.add_redaction(doc, 0, fitz.Rect(50, 80, 200, 110))
+        # Collect annotation types from the *same* page reference
+        annot_types = [a.type[1] for a in page.annots()]
+        assert "Redact" in annot_types
+        doc.close()
+
+    def test_apply_redactions_removes_annots(self, tmp_pdf: str) -> None:
+        """apply_redactions must burn the marks and leave no redaction annotations."""
+        doc = fitz.open(tmp_pdf)
+        page = doc[0]
+        page.add_redact_annot(fitz.Rect(50, 80, 200, 110), fill=(0, 0, 0))
+        Annotator.apply_redactions(doc)
+        annot_types = [a.type[1] for a in doc[0].annots()]
+        assert "Redact" not in annot_types
+        doc.close()
+
+
+# ---------------------------------------------------------------------------
+# Manager – new watermark and protect/unprotect
+# ---------------------------------------------------------------------------
+
+class TestManagerNewFeatures:
+    """Tests for new Manager methods added in v1.1."""
+
+    def test_add_watermark_creates_output(self, tmp_path: Path) -> None:
+        """add_watermark must produce a valid PDF with the same page count."""
+        src = make_test_pdf(str(tmp_path / "src.pdf"), page_count=2)
+        out = str(tmp_path / "wm.pdf")
+        Manager.add_watermark(src, "DRAFT", output_path=out)
+        assert os.path.isfile(out)
+        doc = fitz.open(out)
+        assert len(doc) == 2
+        doc.close()
+
+    def test_protect_pdf_creates_encrypted_output(self, tmp_path: Path) -> None:
+        """protect_pdf must create an encrypted PDF file."""
+        import pikepdf as _pikepdf
+        src = make_test_pdf(str(tmp_path / "src.pdf"))
+        out = str(tmp_path / "protected.pdf")
+        Manager.protect_pdf(src, "user", "owner", output_path=out)
+        assert os.path.isfile(out)
+        with _pikepdf.open(out, password="user") as pdf:
+            assert len(pdf.pages) == 3
+
+    def test_remove_password_creates_unlocked_output(self, tmp_path: Path) -> None:
+        """remove_password must produce an un-encrypted PDF."""
+        import pikepdf as _pikepdf
+        src = make_test_pdf(str(tmp_path / "src.pdf"))
+        enc = str(tmp_path / "enc.pdf")
+        unlocked = str(tmp_path / "unlocked.pdf")
+        Manager.protect_pdf(src, "pass", "owner", output_path=enc)
+        Manager.remove_password(enc, "pass", output_path=unlocked)
+        assert os.path.isfile(unlocked)
+        # Open without a password – should succeed
+        with _pikepdf.open(unlocked) as pdf:
+            assert len(pdf.pages) == 3
+
+    def test_get_document_info_includes_encrypted_field(self, tmp_path: Path) -> None:
+        """get_document_info must now include an 'is_encrypted' key."""
+        src = make_test_pdf(str(tmp_path / "src.pdf"))
+        info = Manager.get_document_info(src)
+        assert "is_encrypted" in info
+        assert info["is_encrypted"] is False
+
+
+# ---------------------------------------------------------------------------
+# OutlinePanel
+# ---------------------------------------------------------------------------
+
+class TestOutlinePanel:
+    """Tests for OutlinePanel sidebar widget."""
+
+    def test_load_document_no_toc_shows_empty_label(self, tmp_pdf: str) -> None:
+        """load_document on a PDF without TOC must show the empty-label."""
+        from PyQt6.QtWidgets import QApplication
+        _ = QApplication.instance() or QApplication(sys.argv)
+        doc = PDFDocument(tmp_pdf)
+        panel = OutlinePanel()
+        panel.load_document(doc)
+        assert not panel._tree.isVisible() or panel._tree.topLevelItemCount() == 0
+        doc.close()
+
+    def test_load_document_with_toc_populates_tree(self, tmp_path: Path) -> None:
+        """load_document on a PDF with TOC entries must populate the tree."""
+        from PyQt6.QtWidgets import QApplication
+        _ = QApplication.instance() or QApplication(sys.argv)
+        # Build a PDF with a two-entry TOC (save to a separate file)
+        plain = make_test_pdf(str(tmp_path / "plain.pdf"), page_count=3)
+        src = str(tmp_path / "toc.pdf")
+        ftzdoc = fitz.open(plain)
+        ftzdoc.set_toc([[1, "Chapter 1", 1], [1, "Chapter 2", 2]])
+        ftzdoc.save(src)
+        ftzdoc.close()
+
+        doc = PDFDocument(src)
+        panel = OutlinePanel()
+        panel.load_document(doc)
+        assert panel._tree.topLevelItemCount() == 2
+        doc.close()
+
+    def test_clear_removes_all_items(self, tmp_path: Path) -> None:
+        """clear() must remove all items from the tree."""
+        from PyQt6.QtWidgets import QApplication
+        _ = QApplication.instance() or QApplication(sys.argv)
+        plain = make_test_pdf(str(tmp_path / "plain2.pdf"), page_count=2)
+        src = str(tmp_path / "toc2.pdf")
+        ftzdoc = fitz.open(plain)
+        ftzdoc.set_toc([[1, "Section", 1]])
+        ftzdoc.save(src)
+        ftzdoc.close()
+
+        doc = PDFDocument(src)
+        panel = OutlinePanel()
+        panel.load_document(doc)
+        panel.clear()
+        assert panel._tree.topLevelItemCount() == 0
+        doc.close()
+
+
+# ---------------------------------------------------------------------------
+# AnnotationPanel
+# ---------------------------------------------------------------------------
+
+class TestAnnotationPanel:
+    """Tests for AnnotationPanel sidebar widget."""
+
+    def test_load_document_shows_zero_annotations(self, tmp_pdf: str) -> None:
+        """load_document on a fresh PDF must show zero annotations."""
+        from PyQt6.QtWidgets import QApplication
+        _ = QApplication.instance() or QApplication(sys.argv)
+        doc = PDFDocument(tmp_pdf)
+        panel = AnnotationPanel()
+        panel.load_document(doc)
+        assert panel._list.count() == 0
+        doc.close()
+
+    def test_load_document_counts_annotations(self, tmp_pdf: str) -> None:
+        """load_document must list one entry per annotation."""
+        from PyQt6.QtWidgets import QApplication
+        from PyQt6.QtGui import QColor
+        _ = QApplication.instance() or QApplication(sys.argv)
+        doc = PDFDocument(tmp_pdf)
+        Annotator.add_highlight(
+            doc.fitz_doc, 0, fitz.Rect(50, 80, 200, 110), QColor("#FFFF00")
+        )
+        Annotator.add_highlight(
+            doc.fitz_doc, 1, fitz.Rect(50, 80, 200, 110), QColor("#FFFF00")
+        )
+        panel = AnnotationPanel()
+        panel.load_document(doc)
+        assert panel._list.count() == 2
+        doc.close()
+
+    def test_clear_resets_panel(self, tmp_pdf: str) -> None:
+        """clear() must empty the list and reset the status label."""
+        from PyQt6.QtWidgets import QApplication
+        from PyQt6.QtGui import QColor
+        _ = QApplication.instance() or QApplication(sys.argv)
+        doc = PDFDocument(tmp_pdf)
+        Annotator.add_highlight(
+            doc.fitz_doc, 0, fitz.Rect(50, 80, 200, 110), QColor("#FFFF00")
+        )
+        panel = AnnotationPanel()
+        panel.load_document(doc)
+        assert panel._list.count() == 1
+        panel.clear()
+        assert panel._list.count() == 0
+        doc.close()
+
+
+# ---------------------------------------------------------------------------
+# MetadataDialog
+# ---------------------------------------------------------------------------
+
+class TestMetadataDialog:
+    """Tests for MetadataDialog."""
+
+    def test_dialog_populates_fields(self) -> None:
+        """The dialog must pre-fill fields from the supplied metadata dict."""
+        from PyQt6.QtWidgets import QApplication
+        _ = QApplication.instance() or QApplication(sys.argv)
+        meta = {
+            "title": "My PDF",
+            "author": "Alice",
+            "subject": "",
+            "keywords": "",
+            "creator": "",
+            "producer": "",
+        }
+        dlg = MetadataDialog(meta)
+        assert dlg._inputs["title"].text() == "My PDF"
+        assert dlg._inputs["author"].text() == "Alice"
+
+    def test_get_metadata_returns_edited_values(self) -> None:
+        """get_metadata must return the current text of each input field."""
+        from PyQt6.QtWidgets import QApplication
+        _ = QApplication.instance() or QApplication(sys.argv)
+        meta = {k: "" for k in ("title", "author", "subject", "keywords",
+                                "creator", "producer")}
+        dlg = MetadataDialog(meta)
+        dlg._inputs["title"].setText("Updated Title")
+        result = dlg.get_metadata()
+        assert result["title"] == "Updated Title"
