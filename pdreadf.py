@@ -3377,7 +3377,19 @@ class MainWindow(QMainWindow):
 #  Entry point
 # ──────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+
+def main() -> None:
+    """Application entry point.
+
+    Creates the ``QApplication``, applies settings, opens any PDFs passed
+    on the command line, and starts the event loop.  When the application
+    is frozen by PyInstaller the function also calls
+    ``multiprocessing.freeze_support()`` so that child-process spawning
+    (if ever used) works correctly on Windows.
+    """
+    import multiprocessing
+    multiprocessing.freeze_support()
+
     app = QApplication(sys.argv)
     app.setApplicationName("PDREADF")
     app.setOrganizationName("nkVas1")
@@ -3392,3 +3404,7 @@ if __name__ == "__main__":
 
     window.show()
     sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
